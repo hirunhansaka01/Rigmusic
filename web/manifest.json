@@ -1,0 +1,35 @@
+{
+    "name": "Rig Music",
+    "short_name": "Rig Music",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#14121F",
+    "theme_color": "#14121F",
+    "description": "Guitarist Practice Toolkit — tuner, chords, AI song finder and riffs.",
+    "orientation": "portrait-primary",
+    "prefer_related_applications": false,
+    "icons": [
+        {
+            "src": "icons/Icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        },
+        {
+            "src": "icons/Icon-maskable-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "maskable"
+        },
+        {
+            "src": "icons/Icon-maskable-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "maskable"
+        }
+    ]
+}
