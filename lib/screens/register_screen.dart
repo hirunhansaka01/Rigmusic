@@ -3,7 +3,6 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import '../theme/app_colors.dart';
 import '../providers/auth_provider.dart';
-import 'login_screen.dart';
 
 /// Sibling of the minimal login: same DM Sans / mint skin.
 /// Validation + AuthProvider.signUp preserved, errors in the same
@@ -132,10 +131,7 @@ class _RegisterScreenState extends State<RegisterScreen> with SingleTickerProvid
                   GestureDetector(
                     onTap: disabled
                         ? null
-                        : () => Navigator.pushReplacement(
-                              context,
-                              MaterialPageRoute(builder: (_) => const LoginScreen()),
-                            ),
+                        : () => Navigator.pop(context),
                     child: Text('Sign in',
                         style: GoogleFonts.dmSans(
                             fontSize: 12, fontWeight: FontWeight.w500, color: AppColors.accent)),

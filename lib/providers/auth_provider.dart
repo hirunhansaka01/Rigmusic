@@ -43,6 +43,13 @@ class AuthProvider extends ChangeNotifier {
     try {
       final prefs = await SharedPreferences.getInstance();
       _guest = (prefs.getBool(_guestKey) ?? false) && _user == null;
+      // Login ▸ "Keep me signed in": the choice is stored on the login
+      // screen, and when it was UNCHECKED the remembered session ends at
+      // the next launch. Defaults to true, so anyone who never touched
+      // the checkbox stays signed in exactly as before.
+      if ((prefs.getBool('keep_signed_in') ?? true) == false && _user != null) {
+        await _service.signOut();
+      }
     } catch (_) {
       _guest = false;
     } finally {

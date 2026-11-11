@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'favorites_store.dart';
 import 'oracle_history.dart';
@@ -71,9 +72,23 @@ class CloudSync {
     _syncedUid = null;
   }
 
+  /// Shared key with PROFILE ▸ Offline Mode: while it is on, no cloud
+  /// traffic leaves the device (favorites/history stay device-local).
+  static const _offlineKey = 'pref_offline';
+
+  Future<bool> _offlineMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_offlineKey) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Captures the server copy, merges it with local, stores the result
   /// locally, then pushes it back. Idempotent and silent.
   Future<void> syncNow() async {
+    if (await _offlineMode()) return; // Offline Mode — keep everything local
     final uid = _uidOrNull;
     if (uid == null || _syncing) return;
     if (_synced && _syncedUid == uid) return; // already captured this session
@@ -115,6 +130,7 @@ class CloudSync {
   /// Called on every local favorites change (wired in the constructor).
   Future<void> pushFavorites(Set<String> names) async {
     try {
+      if (await _offlineMode()) return; // Offline Mode — device-local only
       final uid = _uidOrNull;
       if (uid == null) return; // signed out / tests — local-only
       if (!_synced || _syncedUid != uid) {
@@ -130,6 +146,7 @@ class CloudSync {
   /// Called on every local history change (wired in the constructor).
   Future<void> pushHistory(List<OracleHistoryEntry> entries) async {
     try {
+      if (await _offlineMode()) return; // Offline Mode — device-local only
       final uid = _uidOrNull;
       if (uid == null) return;
       if (!_synced || _syncedUid != uid) {

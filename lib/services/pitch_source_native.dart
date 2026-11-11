@@ -81,10 +81,19 @@ class NativePitchSource implements PitchSource {
 
   void _onChunk(Uint8List bytes) {
     // PCM16 little-endian mono: two bytes per sample.
-    final samples =
-        bytes.buffer.asInt16List(bytes.offsetInBytes, bytes.lengthInBytes ~/ 2);
-    for (final s in samples) {
-      _window[_writePos] = s / 32768.0;
+    //
+    // The platform codec hands each chunk back as a VIEW into the message
+    // buffer, and that view's offset depends on the envelope layout (type
+    // tag + varint size ≈ 3–5 bytes → ODD). Int16 views demand even
+    // offsets, so `asInt16List` would throw RangeError on EVERY chunk —
+    // silently discarding all audio while the mic stays live (the tuner
+    // would show "Listening…" forever with a working microphone).
+    // ByteData.view has no alignment requirement, so read through it.
+    final data =
+        ByteData.view(bytes.buffer, bytes.offsetInBytes, bytes.lengthInBytes);
+    final count = bytes.lengthInBytes >> 1;
+    for (var i = 0; i < count; i++) {
+      _window[_writePos] = data.getInt16(i << 1, Endian.little) / 32768.0;
       _writePos = (_writePos + 1) % _frameSize;
       if (_filled < _frameSize) _filled++;
     }

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -214,27 +215,33 @@ class GeminiService {
   /// Whether requests should go through the backend proxy instead of Google.
   bool get _useProxy => _proxyUrl.trim().isNotEmpty;
 
-  /// Current default model (Gemini 3.8 Flash is the stable Flash model).
+  /// Model routing per the team's router spec (Nov 2026):
+  ///  • 3.8 Flash — DEFAULT for core transcription: best balance of speed
+  ///    and quality, handles Sinhala Unicode + chord alignment, synthesizes
+  ///    conflicting search results into one chord sheet.
+  ///  • 3.5 Flash Lite — fastest model / highest free quota; safety net
+  ///    for straightforward English songs while 3.8 is unavailable.
+  ///  • 3.1 Pro Preview — deep-reasoning escalation. Live probing showed
+  ///    Google reports `limit: 0` on ALL its free-tier metrics for this
+  ///    project (pay-only), so it stays in the picker for when billing is
+  ///    enabled but is kept out of the automatic chain — a model that can
+  ///    never answer would only waste an attempt and mislabel every
+  ///    failure as "rate-limited".
   static const _defaultModel = 'gemini-3.8-flash';
 
-  /// Working models tried in order if the chosen one is unavailable/shut
-  /// down. Older names like gemini-2.0-flash are deprecated, so we fall
-  /// back automatically instead of erroring.
+  /// Tried in order when the chosen model is unavailable, shut down, or
+  /// rate-limited — default first, lite safety net second. Quotas are
+  /// per-model, so moving on after a 429 often succeeds.
   static const _fallbackModels = [
     'gemini-3.8-flash',
-    'gemini-3.6-flash',
     'gemini-3.5-flash-lite',
-    'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
   ];
 
-  /// Models offered in the picker (all current, supported ones).
+  /// Models offered in the picker (exactly the router spec's lineup).
   static const List<String> availableModels = [
     'gemini-3.8-flash',
-    'gemini-3.6-flash',
     'gemini-3.5-flash-lite',
-    'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
+    'gemini-3.1-pro-preview',
   ];
 
   /// Instructions that force Gemini into a compact, parseable shape.
@@ -341,7 +348,13 @@ RULES:
 
   Future<String> getModel() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_modelPref) ?? _defaultModel;
+    final saved = prefs.getString(_modelPref);
+    // Ignore stored names that are no longer offered (older installs may
+    // have a deprecated model saved) so routing always follows the spec.
+    if (saved == null || !availableModels.contains(saved)) {
+      return _defaultModel;
+    }
+    return saved;
   }
 
   Future<void> setModel(String model) async {
@@ -376,9 +389,11 @@ RULES:
     }
 
     String? transientSummary;
+    var rateLimited = false;
     for (final model in toTry) {
       // Try this model up to 3 times to ride out 504 / server-busy blips.
       for (var attempt = 0; attempt < 3; attempt++) {
+        debugPrint('[oracle] trying $model (attempt ${attempt + 1})');
         try {
           final songJson = await _generate(apiKey, model, query);
 
@@ -401,13 +416,38 @@ RULES:
           );
         } on _ModelNotFound {
           break; // model gone — move to the next one (no point retrying)
+        } on _RateLimited catch (e) {
+          // Quotas are per-model: another model in the list usually still
+          // has headroom, so keep going instead of failing the whole search.
+          // When Google supplied a SHORT RetryInfo (per-minute windows),
+          // wait it out and give this model one more chance — that rides
+          // out throttling without spending the next model's quota. Long
+          // delays (per-day exhaustion) skip straight to the next model.
+          rateLimited = true;
+          if (attempt < 1 && e.retryAfter > 0 && e.retryAfter <= 30) {
+            debugPrint(
+                '[oracle] $model throttled — waiting ${e.retryAfter}s per RetryInfo');
+            await Future.delayed(Duration(seconds: e.retryAfter));
+            continue;
+          }
+          break;
+        } on _EmptyResponse {
+          // 200 but nothing usable inside (safety block / empty candidate).
+          // Often stochastic — one quick retry, then fall to the next model.
+          transientSummary = 'the AI returned an empty response';
+          if (attempt < 1) {
+            await Future.delayed(const Duration(seconds: 1));
+            continue;
+          }
+          break;
         } on _TransientError catch (e) {
           transientSummary = e.code == 0
               ? 'connection timed out'
               : 'server returned ${e.code}';
-          // One quick retry, then move on to the next model (keeps total
-          // wait time short in the worst case).
-          if (attempt < 1) {
+          // One quick retry for server-busy 5xx blips — but NOT for client
+          // timeouts: a hung model would then stall the search twice as
+          // long, so timeouts move straight to the next model instead.
+          if (attempt < 1 && e.code != 0) {
             await Future.delayed(const Duration(seconds: 1));
             continue;
           }
@@ -417,6 +457,11 @@ RULES:
     }
 
     // Every model was unavailable — surface a helpful message.
+    if (rateLimited) {
+      throw GeminiException(
+          'Oracle is rate-limited right now (free-tier quota). '
+          'Wait about 30 seconds and try again.');
+    }
     if (transientSummary != null) {
       throw GeminiException(
           'Oracle is working out right now ($transientSummary). '
@@ -427,16 +472,30 @@ RULES:
         'Please check your key and try again.');
   }
 
+  /// Set when grounding (Google Search tool) was rejected with 429 — the
+  /// search tool's quota is separate AND rejected attempts still count as
+  /// request arrivals against the project's per-minute budget, which could
+  /// otherwise trip the limiter mid-chain and take down the working plain
+  /// calls too. Skips the search-tool attempt for a few minutes.
+  DateTime? _groundingBlockedUntil;
+
   /// Runs one model, preferring a Google-Search-grounded call (which keeps the
   /// Oracle anchored to REAL songs) and falling back to a plain call for any
   /// model/key that does not allow the search tool.
   Future<Map<String, dynamic>> _generate(
       String apiKey, String model, String query) async {
-    try {
-      return await _callModel(apiKey, model, query, grounded: true);
-    } on _GroundingUnsupported {
-      return await _callModel(apiKey, model, query, grounded: false);
+    final groundingBlocked = _groundingBlockedUntil != null &&
+        DateTime.now().isBefore(_groundingBlockedUntil!);
+    if (!groundingBlocked) {
+      try {
+        final result = await _callModel(apiKey, model, query, grounded: true);
+        _groundingBlockedUntil = null; // grounding healthy again
+        return result;
+      } on _GroundingUnsupported {
+        // fall through to the plain call below
+      }
     }
+    return await _callModel(apiKey, model, query, grounded: false);
   }
 
   /// Heuristic: does this 400 body complain about the search/grounding tool
@@ -520,11 +579,17 @@ RULES:
     final http.Response response;
     try {
       response = await _post(apiKey, model, payload)
-          .timeout(const Duration(seconds: 75));
+          // 45 s: outputs are kept small by the system prompt (inline
+          // ChordPro), so a healthy answer lands well inside this — 75 s
+      // just made one slow model stall the whole search.
+          .timeout(const Duration(seconds: 45));
     } catch (e) {
       // Network drop / client-side timeout — worth retrying.
+      debugPrint('[oracle] $model grounded=$grounded -> timeout/network');
       throw _TransientError(0);
     }
+    debugPrint(
+        '[oracle] $model grounded=$grounded -> HTTP ${response.statusCode}');
 
     if (response.statusCode == 400 &&
         grounded &&
@@ -533,19 +598,52 @@ RULES:
       // same model without grounding.
       throw _GroundingUnsupported();
     }
+    if (response.statusCode == 429) {
+      if (grounded) {
+        // The Google-Search grounding quota is metered SEPARATELY from
+        // normal generateContent quota and runs out much faster. When it is
+        // used up, retry the same model WITHOUT grounding (identical to the
+        // path a model that refuses the tool takes): plain calls still
+        // answer, so the user gets chords instead of a rate-limit error —
+        // and we pause further search-tool attempts for a few minutes so
+        // rejected requests stop eating the per-minute arrival budget.
+        _groundingBlockedUntil =
+            DateTime.now().add(const Duration(minutes: 3));
+        throw _GroundingUnsupported();
+      }
+      // This model's own quota is throttled — the caller moves to the next
+      // model (quotas are per-model) and only shows a rate-limit message
+      // once every model has been limited. Google's 429 body usually carries
+      // a RetryInfo with the exact wait (e.g. "retryDelay": "12s"); pass it
+      // along so the caller can wait it out and retry this model once
+      // instead of spending the next model's quota too.
+      debugPrint('[oracle] 429 body: ${response.body}');
+      final delayMatch =
+          RegExp(r'"retryDelay":\s*"([\d.]+)s"').firstMatch(response.body);
+      final retryAfter = delayMatch == null
+          ? 0
+          : int.tryParse(delayMatch.group(1)!.split('.').first) ?? 0;
+      throw _RateLimited(retryAfter);
+    }
     if (response.statusCode == 400 || response.statusCode == 403) {
-      throw GeminiException(_useProxy
-          ? 'Oracle rejected that request (the server key may need updating). '
-              'Please try again in a moment.'
-          : 'Invalid API key. Tap the key icon and paste a valid key.');
+      final body = response.body.toLowerCase();
+      final keyProblem = response.statusCode == 403 ||
+          body.contains('api key') ||
+          body.contains('api_key') ||
+          body.contains('api-key');
+      if (keyProblem) {
+        throw GeminiException(_useProxy
+            ? 'Oracle rejected that request (the server key may need updating). '
+                'Please try again in a moment.'
+            : 'Invalid API key. Tap the key icon and paste a valid key.');
+      }
+      // Some other bad argument (not a key problem) — don't blame the key.
+      throw GeminiException(
+          'Oracle rejected that request (${response.statusCode}). Try again.');
     }
     if (response.statusCode == 404) {
       // Model missing — signal the caller to fall back to the next one.
       throw _ModelNotFound('model "$model" not found');
-    }
-    if (response.statusCode == 429) {
-      throw GeminiException(
-          'Rate limited by Oracle. Wait a moment and retry.');
     }
     // 5xx / 504 = server busy or gateway timeout — worth retrying.
     if (response.statusCode >= 500) {
@@ -574,7 +672,13 @@ RULES:
     } catch (_) {}
 
     if (text == null || text.trim().isEmpty) {
-      throw GeminiException('Oracle returned no content for that song.');
+      // A 200 can still carry no usable content (safety/recitation block,
+      // an empty candidate list, or a model that simply answered nothing).
+      // Log the full envelope so the real reason is visible, then signal a
+      // model-level failure so the caller can fall back to the next model
+      // instead of aborting the whole search.
+      debugPrint('[oracle] $model empty content: ${response.body}');
+      throw _EmptyResponse();
     }
 
     // The model sometimes wraps the JSON in ``` fences or adds a sentence
@@ -736,7 +840,22 @@ class _ModelNotFound implements Exception {
 
 /// Internal signal that the model/key refused the Google Search grounding tool
 /// (HTTP 400) so the caller can retry the same model without grounding.
+/// The model refused the Google Search tool (or its grounding quota is
+/// exhausted): the caller retries the SAME model without grounding.
 class _GroundingUnsupported implements Exception {}
+
+/// The model answered HTTP 429 on a plain (ungrounded) call — its own quota
+/// is throttled right now, so the caller should try the next model.
+class _RateLimited implements Exception {
+  _RateLimited([this.retryAfter = 0]);
+
+  /// Seconds Google's RetryInfo asked us to wait (0 = not stated).
+  final int retryAfter;
+}
+
+/// A 200 response whose candidates carried no text (safety block or empty
+/// answer) — a model-level failure, not a user-facing error.
+class _EmptyResponse implements Exception {}
 
 /// Internal signal for a retriable failure (5xx / 504 gateway timeout or a
 /// dropped connection, where [code] is 0). The caller retries these.

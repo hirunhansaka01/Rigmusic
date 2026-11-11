@@ -84,6 +84,7 @@ class _SongbookScreenState extends State<SongbookScreen> {
       if (!mounted) return;
       // Save to history (most recent first) and show the result.
       final updated = await _historyStore.add(q, result.rawJson);
+      if (!mounted) return;
       setState(() {
         _song = result.song;
         _history = updated;

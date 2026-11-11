@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../theme/app_colors.dart';
 import '../providers/auth_provider.dart';
 import 'register_screen.dart';
@@ -33,6 +34,19 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
           setState(() => _error = null);
         }
       });
+    _restoreKeepSignedIn();
+  }
+
+  /// Loads the stored "Keep me signed in" choice so the checkbox reflects
+  /// what the user last picked (default: on — the original behaviour).
+  Future<void> _restoreKeepSignedIn() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final keep = prefs.getBool('keep_signed_in') ?? true;
+      if (mounted && keep != _keepSignedIn) {
+        setState(() => _keepSignedIn = keep);
+      }
+    } catch (_) {}
   }
 
   @override
@@ -288,7 +302,14 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
           ),
           const SizedBox(height: 14),
           GestureDetector(
-            onTap: () => setState(() => _keepSignedIn = !_keepSignedIn),
+            onTap: () async {
+              final next = !_keepSignedIn;
+              setState(() => _keepSignedIn = next);
+              try {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setBool('keep_signed_in', next);
+              } catch (_) {}
+            },
             child: Row(
               children: [
                 Container(

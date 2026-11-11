@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../theme/app_colors.dart';
 import '../providers/auth_provider.dart';
 import 'edit_profile_screen.dart';
@@ -18,9 +19,40 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
+  // Preference keys shared with the screens that consume them:
+  //  • pref_calibration → tuner concert pitch (440 Hz on / 442 Hz off)
+  //  • pref_haptic       → tuner vibration when a string locks in
+  //  • pref_offline      → CloudSync pauses (favorites/history stay local)
   var _calibration = true;
   var _haptic = true;
   var _offline = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _restorePrefs();
+  }
+
+  Future<void> _restorePrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
+      setState(() {
+        _calibration = prefs.getBool('pref_calibration') ?? true;
+        _haptic = prefs.getBool('pref_haptic') ?? true;
+        _offline = prefs.getBool('pref_offline') ?? false;
+      });
+    } catch (_) {
+      // Preferences unavailable — keep the defaults.
+    }
+  }
+
+  Future<void> _savePref(String key, bool value) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(key, value);
+    } catch (_) {}
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -298,23 +330,34 @@ class _ProfileScreenState extends State<ProfileScreen> {
             children: [
               _toggleRow(
                 'Tuner Calibration',
-                'Concert Pitch A = 440 Hz',
+                _calibration
+                    ? 'Concert Pitch A = 440 Hz (standard)'
+                    : 'Concert Pitch A = 442 Hz (brighter)',
                 _calibration,
-                (v) => setState(() => _calibration = v),
+                (v) {
+                  setState(() => _calibration = v);
+                  _savePref('pref_calibration', v);
+                },
                 last: false,
               ),
               _toggleRow(
                 'Haptic Feedback',
-                'Vibrate on accurate pitch detection',
+                'Vibrate when a string is tuned',
                 _haptic,
-                (v) => setState(() => _haptic = v),
+                (v) {
+                  setState(() => _haptic = v);
+                  _savePref('pref_haptic', v);
+                },
                 last: false,
               ),
               _toggleRow(
                 'Offline Mode',
-                'Cache songbook and audio engine offline',
+                'Pause cloud sync (favorites & history stay local)',
                 _offline,
-                (v) => setState(() => _offline = v),
+                (v) {
+                  setState(() => _offline = v);
+                  _savePref('pref_offline', v);
+                },
                 last: true,
               ),
             ],

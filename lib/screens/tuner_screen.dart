@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/pitch_source.dart';
 import '../services/reference_tone.dart';
@@ -56,7 +58,16 @@ class TunerScreenState extends State<TunerScreen> {
   ];
 
   _TuningPreset get _preset => _presets[_presetIndex];
-  double get _targetFrequency => _preset.frequencies[_selectedString];
+
+  /// Concert pitch from PROFILE ▸ "Tuner Calibration": 440 Hz when the
+  /// switch is on (international standard), 442 Hz when off (brighter
+  /// orchestral tuning). Every preset frequency is scaled by this ratio.
+  double _a4 = 440;
+  var _hapticOn = true;
+
+  double get _calFactor => _a4 / 440;
+  double get _targetFrequency =>
+      _preset.frequencies[_selectedString] * _calFactor;
   String get _targetNote => _preset.notes[_selectedString];
   double? get _cents => _frequency == null ? null : 1200 * (math.log(_frequency! / _targetFrequency) / math.ln2);
   bool get _isInTune => _cents != null && _cents!.abs() <= 5;
@@ -70,6 +81,27 @@ class TunerScreenState extends State<TunerScreen> {
     super.initState();
     _pitchSource = createPitchSource();
     _selectedString = _tuneOrder.first; // 1st (highest) string of the default preset
+    _restorePrefs();
+  }
+
+  /// Re-reads the Profile preferences. Runs at startup and again each time
+  /// the TUNER tab is entered, so calibration/haptic changes made on
+  /// PROFILE apply immediately.
+  Future<void> _restorePrefs() async {
+    bool calibrated;
+    bool haptic;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      calibrated = prefs.getBool('pref_calibration') ?? true;
+      haptic = prefs.getBool('pref_haptic') ?? true;
+    } catch (_) {
+      return;
+    }
+    final a4 = calibrated ? 440.0 : 442.0;
+    if (a4 == _a4 && haptic == _hapticOn) return;
+    _a4 = a4;
+    _hapticOn = haptic;
+    if (mounted) setState(() {});
   }
 
   @override
@@ -84,6 +116,8 @@ class TunerScreenState extends State<TunerScreen> {
   Future<void> startMic() async {
     if (_isListening || _starting) return;
     _starting = true;
+    await _restorePrefs(); // pick up Profile changes made since last entry
+    if (!mounted) return;
     setState(() => _error = null);
     try {
       await _pitchSource.start();
@@ -159,14 +193,17 @@ class TunerScreenState extends State<TunerScreen> {
     var closest = 0;
     var smallestDistance = double.infinity;
     for (var index = 0; index < _preset.frequencies.length; index++) {
-      final distance = (1200 * (math.log(frequency / _preset.frequencies[index]) / math.ln2)).abs();
+      final distance = (1200 *
+              (math.log(frequency / (_preset.frequencies[index] * _calFactor)) /
+                  math.ln2))
+          .abs();
       if (distance < smallestDistance) {
         smallestDistance = distance;
         closest = index;
       }
     }
 
-    final targetFreq = _preset.frequencies[closest];
+    final targetFreq = _preset.frequencies[closest] * _calFactor;
     final cents = 1200 * (math.log(frequency / targetFreq) / math.ln2);
     final inTune = cents.abs() <= 5;
 
@@ -201,6 +238,8 @@ class TunerScreenState extends State<TunerScreen> {
     _streakString = null;
     _streakCount = 0;
     _cooldownUntil = DateTime.now().add(const Duration(milliseconds: 850));
+    // PROFILE ▸ Haptic Feedback: buzz once when a string locks in as tuned.
+    if (_hapticOn) HapticFeedback.mediumImpact();
 
     int? next;
     for (final i in _tuneOrder) {
@@ -402,12 +441,12 @@ class TunerScreenState extends State<TunerScreen> {
             ),
           ),
         ),
-        const Row(
+        Row(
           children: [
-            Icon(Icons.circle, size: 6, color: AppColors.tertiary),
-            SizedBox(width: 6),
-            Text('A₄ = 440 Hz',
-                style: TextStyle(fontSize: 11, letterSpacing: 1.0, color: AppColors.onSurfaceVariant)),
+            const Icon(Icons.circle, size: 6, color: AppColors.tertiary),
+            const SizedBox(width: 6),
+            Text('A₄ = ${_a4.round()} Hz',
+                style: const TextStyle(fontSize: 11, letterSpacing: 1.0, color: AppColors.onSurfaceVariant)),
           ],
         ),
       ],

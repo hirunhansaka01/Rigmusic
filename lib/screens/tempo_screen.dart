@@ -1,4 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import '../services/reference_tone.dart';
 import '../theme/app_colors.dart';
 
 class TempoScreen extends StatefulWidget {
@@ -21,7 +25,149 @@ class _TempoScreenState extends State<TempoScreen> {
   final _timeSigs = ['4/4', '3/4', '6/8', '2/4', '5/4', '12/8'];
   String _timeSig = '4/4';
 
-  void _changeBpm(int d) => setState(() => _bpm = (_bpm + d).clamp(30, 240));
+  // ── Live metronome engine ───────────────────────────────────────────────
+  // START spawns a Timer that fires one tick per subdivision; each tick
+  // advances the beat, buzzes the device (Haptic Tap) and — where the
+  // platform can play tones (web) — clicks a woodblock-ish pitch.
+  Timer? _tickTimer;
+  int _subTick = 0; // subdivisions elapsed inside the current beat
+  DateTime? _runStartedAt; // when the current run began
+  Duration _ranFor = Duration.zero; // elapsed from previous runs (pause keeps it)
+  final List<DateTime> _taps = []; // tap-tempo samples (3 s window)
+  double? _tapBpm; // last tap-computed tempo
+
+  /// Subdivision ticks that make up one beat (♩ / ♫ / 3 / ♬).
+  int get _subsPerBeat => switch (_subdivision) {
+        'Eighth' => 2,
+        'Triplets' => 3,
+        '16th' => 4,
+        _ => 1,
+      };
+
+  /// Time elapsed in the current session (frozen while stopped).
+  Duration get _elapsed =>
+      _ranFor +
+      (_runStartedAt == null
+          ? Duration.zero
+          : DateTime.now().difference(_runStartedAt!));
+
+  String get _elapsedLabel {
+    final e = _elapsed;
+    final m = e.inMinutes;
+    final s = e.inSeconds % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  void _changeBpm(int d) {
+    setState(() => _bpm = (_bpm + d).clamp(30, 240));
+    if (_isPlaying) _restartTicks(); // live retune of the running pulse
+  }
+
+  /// (Re)starts the tick timer at the current bpm/subdivision.
+  void _restartTicks() {
+    _tickTimer?.cancel();
+    _tickTimer = null;
+    if (!_isPlaying) return;
+    final interval =
+        (60000 / _bpm / _subsPerBeat).round().clamp(20, 60000);
+    _tickTimer = Timer.periodic(
+        Duration(milliseconds: interval), (_) => _tick());
+  }
+
+  /// START / STOP. Starting snaps to beat 1 so the bar always opens on the
+  /// downbeat; stopping freezes the session clock instead of resetting it.
+  void _togglePlay() {
+    setState(() {
+      _isPlaying = !_isPlaying;
+      if (_isPlaying) {
+        _currentBeat = 0;
+        _subTick = 0;
+        _runStartedAt = DateTime.now();
+      } else {
+        if (_runStartedAt != null) {
+          _ranFor += DateTime.now().difference(_runStartedAt!);
+        }
+        _runStartedAt = null;
+        _tickTimer?.cancel();
+        _tickTimer = null;
+      }
+    });
+    if (_isPlaying) {
+      _restartTicks();
+      _tick(); // immediate downbeat instead of waiting one interval
+    }
+  }
+
+  /// One subdivision step: advance the beat when due, then click/buzz.
+  void _tick() {
+    if (!mounted || !_isPlaying) return;
+    _subTick++;
+    final onBeat = _subTick % _subsPerBeat == 0;
+    if (onBeat) {
+      setState(() => _currentBeat = (_currentBeat + 1) % _beats);
+    }
+    final downbeat = onBeat && _currentBeat == 0;
+    final accent = downbeat && _accentFirst;
+    if (_haptic) {
+      if (accent) {
+        HapticFeedback.mediumImpact();
+      } else {
+        HapticFeedback.selectionClick();
+      }
+    }
+    // Android has no built-in click sound in this app (reference tones are
+    // web-only), so there the visual pulse + haptics carry the beat; on web
+    // a short high pitch doubles as the click.
+    if (referenceToneSupported) {
+      playTone(accent ? 1661.2 : 1108.7, seconds: 0.05).ignore();
+    }
+  }
+
+  /// Real tap tempo: averages the intervals of taps made within 3 seconds
+  /// and applies the result immediately (running pulse retunes live).
+  void _tapTempo() {
+    final now = DateTime.now();
+    _taps.removeWhere((t) => now.difference(t).inMilliseconds > 3000);
+    _taps.add(now);
+    double? avg;
+    if (_taps.length >= 2) {
+      var spanMs = 0;
+      for (var i = 1; i < _taps.length; i++) {
+        spanMs += _taps[i].difference(_taps[i - 1]).inMilliseconds;
+      }
+      avg = 60000 / (spanMs / (_taps.length - 1));
+    }
+    if (avg == null) {
+      setState(() {}); // first tap — nothing to average yet
+      return;
+    }
+    final tapped = avg.clamp(30.0, 240.0).toDouble();
+    setState(() {
+      _tapBpm = tapped;
+      _bpm = tapped.round();
+    });
+    if (_isPlaying) _restartTicks();
+  }
+
+  void _setSubdivision(String label) {
+    setState(() => _subdivision = label);
+    if (_isPlaying) _restartTicks();
+  }
+
+  void _setTimeSig(String t) {
+    setState(() {
+      _timeSig = t;
+      _beats = int.tryParse(t.split('/').first) ?? 4;
+      _currentBeat %= _beats; // keep the highlight inside the new bar
+    });
+    if (_isPlaying) _restartTicks();
+  }
+
+  @override
+  void dispose() {
+    _tickTimer?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -129,11 +275,17 @@ class _TempoScreenState extends State<TempoScreen> {
             Container(height: 6, decoration: BoxDecoration(color: AppColors.surfaceContainerLowest, borderRadius: BorderRadius.circular(999)), child: FractionallySizedBox(alignment: Alignment.centerLeft, widthFactor: (_bpm - 30) / 210, child: Container(decoration: BoxDecoration(gradient: const LinearGradient(colors: [AppColors.secondary, AppColors.primary]), borderRadius: BorderRadius.circular(999))))),
             const SizedBox(height: 12),
             GestureDetector(
-              onTap: () => setState(() => _bpm = 120),
+              onTap: _tapTempo,
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                 decoration: BoxDecoration(color: AppColors.surfaceContainerHigh, borderRadius: BorderRadius.circular(999)),
-                child: const Row(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.touch_app, size: 16, color: AppColors.secondary), SizedBox(width: 8), Text('TAP TEMPO • Avg Sync: 120.0 BPM', style: TextStyle(fontSize: 12, color: AppColors.onSurface))]),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.touch_app, size: 16, color: AppColors.secondary),
+                  const SizedBox(width: 8),
+                  Text(
+                      'TAP TEMPO • Avg Sync: ${_tapBpm == null ? 'tap to set' : '${_tapBpm!.toStringAsFixed(1)} BPM'}',
+                      style: const TextStyle(fontSize: 12, color: AppColors.onSurface)),
+                ]),
               ),
             ),
           ],
@@ -197,10 +349,7 @@ class _TempoScreenState extends State<TempoScreen> {
             children: _timeSigs.map((t) {
               final sel = t == _timeSig;
               return GestureDetector(
-                onTap: () => setState(() {
-                  _timeSig = t;
-                  _beats = int.tryParse(t.split('/').first) ?? 4;
-                }),
+                onTap: () => _setTimeSig(t),
                 child: Container(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10), decoration: BoxDecoration(color: sel ? AppColors.secondary : AppColors.surfaceContainerHigh, borderRadius: BorderRadius.circular(12)), child: Text(t, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: sel ? AppColors.onSecondary : AppColors.onSurface))),
               );
             }).toList(),
@@ -224,7 +373,7 @@ class _TempoScreenState extends State<TempoScreen> {
   Widget _subChip(String label, String glyph) {
     final sel = label == _subdivision;
     return GestureDetector(
-      onTap: () => setState(() => _subdivision = label),
+      onTap: () => _setSubdivision(label),
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 10),
         decoration: BoxDecoration(color: sel ? AppColors.tertiary.withValues(alpha: 0.2) : AppColors.surfaceContainerHigh, borderRadius: BorderRadius.circular(12), border: sel ? Border.all(color: AppColors.tertiary) : null),
@@ -290,13 +439,16 @@ class _TempoScreenState extends State<TempoScreen> {
             children: presets.entries.map((e) {
               final sel = _preset == e.key;
               return GestureDetector(
-                onTap: () => setState(() { _preset = e.key; _bpm = e.value; }),
+                onTap: () {
+                  setState(() { _preset = e.key; _bpm = e.value; });
+                  if (_isPlaying) _restartTicks();
+                },
                 child: Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10), decoration: BoxDecoration(color: sel ? AppColors.secondary.withValues(alpha: 0.2) : AppColors.surfaceContainerHigh, borderRadius: BorderRadius.circular(12), border: sel ? Border.all(color: AppColors.secondary) : null), child: Text('${e.key} • ${e.value}', style: TextStyle(fontSize: 12, color: sel ? AppColors.secondary : AppColors.onSurface))),
               );
             }).toList(),
           ),
           const SizedBox(height: 12),
-          const Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text('SESSION CLOCK • 14:22.0', style: TextStyle(fontSize: 10, color: AppColors.onSurfaceVariant, letterSpacing: 1)), Row(children: [Icon(Icons.flashlight_on, size: 16, color: AppColors.onSurfaceVariant), SizedBox(width: 8), Icon(Icons.volume_up, size: 16, color: AppColors.secondary)])]),
+          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text('SESSION CLOCK • $_elapsedLabel', style: const TextStyle(fontSize: 10, color: AppColors.onSurfaceVariant, letterSpacing: 1)), Row(children: [Icon(Icons.flashlight_on, size: 16, color: _isPlaying ? AppColors.tertiary : AppColors.onSurfaceVariant), const SizedBox(width: 8), Icon(Icons.volume_up, size: 16, color: referenceToneSupported ? AppColors.secondary : AppColors.onSurfaceVariant)])]),
         ],
       ),
     );
@@ -308,10 +460,7 @@ class _TempoScreenState extends State<TempoScreen> {
       child: SizedBox(
         width: double.infinity, height: 56,
         child: ElevatedButton.icon(
-          onPressed: () => setState(() {
-            _isPlaying = !_isPlaying;
-            if (_isPlaying) _currentBeat = (_currentBeat + 1) % _beats;
-          }),
+          onPressed: _togglePlay,
           icon: Icon(_isPlaying ? Icons.stop : Icons.play_arrow),
           label: Text(_isPlaying ? 'STOP' : 'START'),
           style: ElevatedButton.styleFrom(backgroundColor: AppColors.secondary, foregroundColor: AppColors.onSecondary, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999))),
